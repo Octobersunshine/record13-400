@@ -1,9 +1,12 @@
 import hashlib
-import os
+import gc
 from flask import Flask, request, jsonify, render_template_string
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
+
+CHUNK_SIZE = 1024 * 1024
 
 ALLOWED_ALGORITHMS = {'md5', 'sha1', 'sha256'}
 
@@ -355,24 +358,33 @@ HTML_TEMPLATE = '''
 '''
 
 
-def calculate_file_hash(file_obj, algorithms, chunk_size=8192):
+_HASHER_MAP = {
+    'md5': hashlib.md5,
+    'sha1': hashlib.sha1,
+    'sha256': hashlib.sha256,
+}
+
+
+def calculate_file_hash(stream, algorithms, chunk_size=CHUNK_SIZE):
     hashers = {}
     for alg in algorithms:
-        if alg == 'md5':
-            hashers[alg] = hashlib.md5()
-        elif alg == 'sha1':
-            hashers[alg] = hashlib.sha1()
-        elif alg == 'sha256':
-            hashers[alg] = hashlib.sha256()
+        factory = _HASHER_MAP.get(alg)
+        if factory is None:
+            raise ValueError(f'不支持的算法: {alg}')
+        hashers[alg] = factory()
 
-    while True:
-        chunk = file_obj.read(chunk_size)
-        if not chunk:
-            break
+    total_size = 0
+    chunk = stream.read(chunk_size)
+    while chunk:
+        total_size += len(chunk)
         for hasher in hashers.values():
             hasher.update(chunk)
+        del chunk
+        gc.collect()
+        chunk = stream.read(chunk_size)
 
-    return {alg: hasher.hexdigest() for alg, hasher in hashers.items()}
+    result = {alg: hasher.hexdigest() for alg, hasher in hashers.items()}
+    return result, total_size
 
 
 @app.route('/', methods=['GET'])
@@ -385,8 +397,8 @@ def hash_endpoint():
     if 'file' not in request.files:
         return jsonify({'error': '未上传文件'}), 400
 
-    file = request.files['file']
-    if file.filename == '':
+    file_storage = request.files['file']
+    if file_storage.filename == '':
         return jsonify({'error': '未选择文件'}), 400
 
     algorithms = request.form.getlist('algorithms')
@@ -400,17 +412,23 @@ def hash_endpoint():
         }), 400
 
     try:
-        file.seek(0, os.SEEK_END)
-        file_size = file.tell()
-        file.seek(0)
+        filename = secure_filename(file_storage.filename) or file_storage.filename
 
-        hashes = calculate_file_hash(file, algorithms)
+        stream = file_storage.stream
+        try:
+            stream.seek(0)
+        except Exception:
+            pass
+
+        hashes, file_size = calculate_file_hash(stream, algorithms)
 
         return jsonify({
-            'filename': file.filename,
+            'filename': filename,
             'size': file_size,
             'hashes': hashes
         })
+    except MemoryError:
+        return jsonify({'error': '内存不足，文件过大'}), 413
     except Exception as e:
         return jsonify({'error': f'处理文件时出错: {str(e)}'}), 500
 
