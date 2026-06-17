@@ -1,5 +1,6 @@
 import hashlib
 import gc
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, render_template_string
 from werkzeug.utils import secure_filename
 
@@ -7,6 +8,8 @@ app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024
 
 CHUNK_SIZE = 1024 * 1024
+
+PARALLEL_THRESHOLD = 2
 
 ALLOWED_ALGORITHMS = {'md5', 'sha1', 'sha256'}
 
@@ -365,13 +368,18 @@ _HASHER_MAP = {
 }
 
 
-def calculate_file_hash(stream, algorithms, chunk_size=CHUNK_SIZE):
+def _create_hashers(algorithms):
     hashers = {}
     for alg in algorithms:
         factory = _HASHER_MAP.get(alg)
         if factory is None:
             raise ValueError(f'不支持的算法: {alg}')
         hashers[alg] = factory()
+    return hashers
+
+
+def calculate_file_hash(stream, algorithms, chunk_size=CHUNK_SIZE):
+    hashers = _create_hashers(algorithms)
 
     total_size = 0
     chunk = stream.read(chunk_size)
@@ -387,19 +395,54 @@ def calculate_file_hash(stream, algorithms, chunk_size=CHUNK_SIZE):
     return result, total_size
 
 
+def calculate_file_hash_parallel(stream, algorithms, chunk_size=CHUNK_SIZE, max_workers=None):
+    hashers = _create_hashers(algorithms)
+
+    if max_workers is None:
+        max_workers = len(hashers)
+
+    hasher_list = list(hashers.values())
+
+    def _update_all(chunk_bytes):
+        for h in hasher_list:
+            h.update(chunk_bytes)
+
+    total_size = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        chunk = stream.read(chunk_size)
+        while chunk:
+            total_size += len(chunk)
+            futures = [executor.submit(h.update, chunk) for h in hasher_list]
+            for f in futures:
+                f.result()
+            del chunk
+            del futures
+            gc.collect()
+            chunk = stream.read(chunk_size)
+
+    result = {alg: hasher.hexdigest() for alg, hasher in hashers.items()}
+    return result, total_size
+
+
+def calculate_file_hash_auto(stream, algorithms, chunk_size=CHUNK_SIZE):
+    if len(algorithms) >= PARALLEL_THRESHOLD:
+        return calculate_file_hash_parallel(stream, algorithms, chunk_size)
+    return calculate_file_hash(stream, algorithms, chunk_size)
+
+
 @app.route('/', methods=['GET'])
 def index():
     return render_template_string(HTML_TEMPLATE)
 
 
-@app.route('/hash', methods=['POST'])
-def hash_endpoint():
+def _validate_and_get_request():
     if 'file' not in request.files:
-        return jsonify({'error': '未上传文件'}), 400
+        return None, None, None, (jsonify({'error': '未上传文件'}), 400)
 
     file_storage = request.files['file']
     if file_storage.filename == '':
-        return jsonify({'error': '未选择文件'}), 400
+        return None, None, None, (jsonify({'error': '未选择文件'}), 400)
 
     algorithms = request.form.getlist('algorithms')
     if not algorithms:
@@ -407,25 +450,66 @@ def hash_endpoint():
 
     invalid_algs = [alg for alg in algorithms if alg not in ALLOWED_ALGORITHMS]
     if invalid_algs:
-        return jsonify({
+        return None, None, None, (jsonify({
             'error': f'不支持的算法: {", ".join(invalid_algs)}。支持的算法: md5, sha1, sha256'
-        }), 400
+        }), 400)
+
+    return file_storage, algorithms, None, None
+
+
+@app.route('/hash', methods=['POST'])
+def hash_endpoint():
+    file_storage, algorithms, _, error = _validate_and_get_request()
+    if error:
+        return error
 
     try:
         filename = secure_filename(file_storage.filename) or file_storage.filename
-
         stream = file_storage.stream
         try:
             stream.seek(0)
         except Exception:
             pass
 
-        hashes, file_size = calculate_file_hash(stream, algorithms)
+        hashes, file_size = calculate_file_hash_auto(stream, algorithms)
 
         return jsonify({
             'filename': filename,
             'size': file_size,
-            'hashes': hashes
+            'hashes': hashes,
+            'parallel': len(algorithms) >= PARALLEL_THRESHOLD
+        })
+    except MemoryError:
+        return jsonify({'error': '内存不足，文件过大'}), 413
+    except Exception as e:
+        return jsonify({'error': f'处理文件时出错: {str(e)}'}), 500
+
+
+@app.route('/hash/parallel', methods=['POST'])
+def hash_parallel_endpoint():
+    file_storage, algorithms, _, error = _validate_and_get_request()
+    if error:
+        return error
+
+    try:
+        filename = secure_filename(file_storage.filename) or file_storage.filename
+        stream = file_storage.stream
+        try:
+            stream.seek(0)
+        except Exception:
+            pass
+
+        import time
+        t0 = time.perf_counter()
+        hashes, file_size = calculate_file_hash_parallel(stream, algorithms)
+        elapsed = time.perf_counter() - t0
+
+        return jsonify({
+            'filename': filename,
+            'size': file_size,
+            'hashes': hashes,
+            'parallel': True,
+            'elapsed_seconds': round(elapsed, 4)
         })
     except MemoryError:
         return jsonify({'error': '内存不足，文件过大'}), 413
